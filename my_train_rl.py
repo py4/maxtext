@@ -157,11 +157,12 @@ def _patch_maxtext_rewards():
 
   utils_rl.match_format_exactly = vtc_partial_credit_reward
   utils_rl.match_format_approximately = _zero_reward
+  utils_rl.check_answer = _zero_reward
   utils_rl.check_numbers = _zero_reward
   print(
       "[my_train_rl] patched utils_rl reward fns:"
       " match_format_exactly -> vtc_partial_credit_reward;"
-      " match_format_approximately/check_numbers -> _zero_reward",
+      " match_format_approximately/check_answer/check_numbers -> _zero_reward",
       flush=True,
   )
 
