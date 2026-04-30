@@ -1,0 +1,121 @@
+# Long-running PathwaysJob for the MaxText track of the Qwen3-1.7B
+# GSM8K GRPO reproduction. Mirrors the user's prior working "Run 7"
+# setup (tokens via k8s secrets instead of hardcoded).
+apiVersion: pathways-job.pathways.domain/v1
+kind: PathwaysJob
+metadata:
+  name: qw3-17b-rl
+spec:
+  pathwaysDir: gs://vtc-pathways-scratch-infinipod-shared-dev
+  pathwaysVersion: "20260305-jax_0.8.1"
+  maxRestarts: 5
+  workers:
+  - type: ct6e-standard-4t
+    topology: 8x8
+    numSlices: 1
+    maxSliceRestarts: 1
+  controller:
+    deploymentMode: default
+    template:
+      spec:
+        serviceAccountName: pathways-sa
+        containers:
+        - name: main
+          image: gcr.io/infinipod-shared-dev/maxtext_post_training_stable:0.2.1
+          env:
+          - name: HF_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: hf-token
+                key: token
+          - name: WANDB_API_KEY
+            valueFrom:
+              secretKeyRef:
+                name: wandb-token
+                key: token
+          - name: WANDB_ENTITY
+            value: "pooyam-google"
+          - name: WANDB_PROJECT
+            value: "maxtext-85-repro"
+          - name: JAX_RANDOM_WEIGHTS
+            value: "1"
+          - name: VLLM_ENABLE_V1_MULTIPROCESSING
+            value: "0"
+          - name: NEW_MODEL_DESIGN
+            value: "1"
+          - name: ENABLE_PATHWAYS_PERSISTENCE
+            value: "1"
+          command:
+          - bash
+          - -c
+          - |
+            set -ex
+            export JAX_PLATFORMS=proxy,cpu
+            pip install math_verify pathwaysutils 2>&1 | tail -5
+
+            # Patch image-baked maxtext globals.py to register qwen3-1.7b
+            # variants. (We later kubectl-cp our own maxtext over /workspace,
+            # which has these registrations baked in.)
+            GLOBALS_FILE=$(python3 -c "import maxtext.utils.globals as g; print(g.__file__)" 2>/dev/null || echo "")
+            if [[ -n "$GLOBALS_FILE" ]]; then
+              if ! grep -q "qwen3-1.7b" "$GLOBALS_FILE"; then
+                sed -i 's|"qwen3-0.6b": "Qwen/Qwen3-0.6B",|"qwen3-0.6b": "Qwen/Qwen3-0.6B",\n    "qwen3-1.7b-base": "Qwen/Qwen3-1.7B-Base",\n    "qwen3-1.7b": "Qwen/Qwen3-1.7B",|' "$GLOBALS_FILE"
+                echo "[ctrl] patched globals.py"
+              else
+                echo "[ctrl] globals.py already has qwen3-1.7b"
+              fi
+            fi
+
+            # VTC chat template (parser eats this; my_train_rl.py also
+            # monkey-patches the prompt to be more raw)
+            cat > /tmp/gsm8k_qwen3.json << 'TMPL_EOF'
+            {
+              "SYSTEM_PROMPT": "Solve the following math problem. First, put your detailed step-by-step reasoning inside {reasoning_start_token}...{reasoning_end_token} tags. Then, put your final numerical answer inside {solution_start_token}\\boxed{{}}{solution_end_token} tags. Do not put anything else in the answer tags.",
+              "TEMPLATE": "{system_prompt}\n\nProblem: {question}"
+            }
+            TMPL_EOF
+
+            mkdir -p /workspace
+            echo ""
+            echo "================================================================"
+            echo "=== Pod READY. Sync local maxtext + my_train_rl.py via:      ==="
+            echo "================================================================"
+            echo "  kubectl cp ~/maxtext         <pod>:/workspace/ -c main"
+            echo "  kubectl cp ~/my_train_rl.py  <pod>:/workspace/ -c main"
+            echo ""
+            echo "Then exec in and run:"
+            echo "  kubectl exec -it <pod> -c main -- bash"
+            echo "  pip install -e /workspace/maxtext"
+            echo "  export JAX_PLATFORMS=proxy,cpu"
+            echo "  python3 -u /workspace/my_train_rl.py \\"
+            echo "    /workspace/maxtext/src/maxtext/configs/post_train/rl.yml \\"
+            echo "    model_name=qwen3-1.7b \\"
+            echo "    tokenizer_path=Qwen/Qwen3-1.7B \\"
+            echo "    load_parameters_path=gs://vtc-pathways-scratch-infinipod-shared-dev/models/qwen3-1.7b/0/items \\"
+            echo "    dataset_name=gsm8k \\"
+            echo "    run_name=qwen3-1.7b-grpo-vtc-run1 \\"
+            echo "    base_output_directory=gs://vtc-pathways-scratch-infinipod-shared-dev/runs/qwen3-1.7b-grpo-vtc \\"
+            echo "    hf_access_token=\$HF_TOKEN \\"
+            echo "    chat_template_path=/tmp/gsm8k_qwen3.json \\"
+            echo "    batch_size=4 num_batches=200 num_test_batches=32 \\"
+            echo "    learning_rate=2e-7 learning_rate_schedule_steps=500 warmup_steps_fraction=0.25 \\"
+            echo "    max_prefill_predict_length=128 gradient_clipping_threshold=1.0 \\"
+            echo "    adam_weight_decay=0.01 adam_b2=0.999 \\"
+            echo "    rl.grpo_beta=0.04 rl.grpo_epsilon=0.2 \\"
+            echo "    rl.num_generations=8 rl.num_iterations=2 \\"
+            echo "    hbm_utilization_vllm=0.50 \\"
+            echo "    checkpoint_storage_concurrent_gb=48 load_checkpoint_only_once=True \\"
+            echo "    jax_cache_dir=gs://vtc-pathways-scratch-infinipod-shared-dev/jax_cache/qwen3-1.7b-grpo-vtc \\"
+            echo "    rollout_tensor_parallelism=4 rollout_data_parallelism=-1 \\"
+            echo "    'vllm_hf_overrides={architectures: [MaxTextForCausalLM]}' \\"
+            echo "    'vllm_additional_config={maxtext_config: {model_name: qwen3-1.7b, allow_split_physical_axes: true, log_config: false, weight_dtype: bfloat16}}'"
+            echo "================================================================"
+
+            sleep infinity
+          resources:
+            limits:
+              cpu: "16"
+              memory: 64Gi
+            requests:
+              cpu: "8"
+              memory: 32Gi
