@@ -298,6 +298,144 @@ def _patch_vllm_rollout_kwargs():
   )
 
 
+def _patch_rollout_return_logprobs():
+  """Force RolloutConfig.return_logprobs=True so vLLM populates per-token
+  logprobs on the rollout output.
+
+  Why: tunix's RolloutConfig.return_logprobs defaults to False
+  (base_rollout.py:117), and MaxText's train_rl.py:504 doesn't override it.
+  Consequence: vllm_sampler.py:530 passes `logprobs=None` to the vLLM
+  engine, so `self.output.logprobs` ends up as a list of empty lists
+  (verified empirically in v11 attempt #1: `len(rollout_logprobs)=32,
+  first_seq_len=0`). Setting return_logprobs=True is the prerequisite for
+  the `_patch_grpo_old_logprobs` patch below to have any data to read.
+  """
+  from tunix.rl.rollout import base_rollout as _br
+
+  _orig_init = _br.RolloutConfig.__init__
+
+  def _patched_init(self, *args, **kwargs):
+    kwargs["return_logprobs"] = True
+    _orig_init(self, *args, **kwargs)
+
+  _br.RolloutConfig.__init__ = _patched_init
+  print(
+      "[my_train_rl] patched RolloutConfig.__init__ ->"
+      " return_logprobs=True (prerequisite for old-logprobs-from-rollout)",
+      flush=True,
+  )
+
+
+def _patch_grpo_old_logprobs():
+  """Feed vLLM rollout-time logprobs as `old_per_token_logps` even with
+  num_iterations=1, mirroring NeMo-RL's GPU path.
+
+  Why: tunix's grpo_learner sets old_per_token_logps=None when
+  num_iterations==1 (grpo_learner.py:296), and the loss falls back to
+  jax.lax.stop_gradient(per_token_logps) (grpo_learner.py:514-515). That
+  makes the PPO ratio exp(per_token_logps - old_per_token_logps) identically
+  1.0, so the policy-gradient term collapses to -mean(advantage) ≈ 0 (group
+  normalized) and only KL drives training. Direct evidence: actor/train/
+  pg_clipfrac=0 uniformly across v6/v8/v9/v10 TBs.
+
+  GPU NeMo-RL never takes that shortcut: even on the first PPO mini-batch,
+  it feeds vLLM's rollout-time logprobs as old_logprobs. Bf16 drift between
+  vLLM rollout and the Flax trainer forward gives probs_ratio ∈ ~[0.5, 2.0]
+  (cross-checked from wandb run fqzrr3i7) → real PPO clipping → real
+  policy-gradient signal.
+
+  Implementation: VllmRollout caches its sampler output on self.output
+  (vllm_rollout.py:93), so self.rl_cluster.rollout.output.logprobs holds
+  the per-completion-token logprobs from the most recent generate() call.
+  We pad them to match completion_mask.shape (right-pad with 0; masked out
+  by completion_mask in the loss) and stamp them onto train_example.
+
+  Sidesteps b/428730696 entirely: never invokes VllmRollout.get_per_token_logps
+  (the broken path that crashes jnp.concatenate at rl_cluster.py:1034 when
+  its Python list-of-lists return value hits jnp). We do the
+  list→np.ndarray→jnp conversion ourselves, once per step, in driver code.
+  """
+  import jax.numpy as jnp
+  import numpy as np
+  from tunix.rl.grpo import grpo_learner as _gl
+
+  _orig_gca = _gl.GrpoLearner._generate_and_compute_advantage
+  _state = {"announced": False, "warned_missing": False}
+
+  def _patched_gca(self, *args, **kwargs):
+    train_example = _orig_gca(self, *args, **kwargs)
+    if train_example.old_per_token_logps is not None:
+      return train_example  # num_iter>=2 already populated; leave alone
+
+    rollout_logprobs = getattr(
+        getattr(self.rl_cluster.rollout, "output", None), "logprobs", None
+    )
+    if rollout_logprobs is None:
+      if not _state["warned_missing"]:
+        _state["warned_missing"] = True
+        print(
+            "[my_train_rl] WARN: rl_cluster.rollout.output.logprobs is None;"
+            " falling back to tunix's stop_grad shortcut (probs_ratio≡1).",
+            flush=True,
+        )
+      return train_example
+
+    bs, max_len = train_example.completion_mask.shape
+    padded = np.zeros((bs, max_len), dtype=np.float32)
+    n_seqs = min(len(rollout_logprobs), bs)
+    total_filled = 0
+    for i in range(n_seqs):
+      arr = np.asarray(rollout_logprobs[i], dtype=np.float32)
+      n = min(arr.shape[0], max_len)
+      padded[i, :n] = arr[:n]
+      total_filled += n
+
+    if total_filled == 0:
+      # Empty rollout logprobs (e.g. return_logprobs=False). All-zero
+      # old_per_token_logps would make ratio=exp(per_token_logps) which is
+      # mathematically WORSE than the stop_grad shortcut (ratio≡1). Fall
+      # back to leaving old_per_token_logps=None so tunix's loss takes
+      # the safe stop_grad path.
+      if not _state["warned_missing"]:
+        _state["warned_missing"] = True
+        print(
+            "[my_train_rl] WARN: rollout_logprobs is all-empty"
+            f" (len={len(rollout_logprobs)}, first_seq_len="
+            f"{len(rollout_logprobs[0]) if len(rollout_logprobs) else 0})."
+            " Likely RolloutConfig.return_logprobs=False. Falling back to"
+            " stop_grad shortcut for this step (and all subsequent unless"
+            " logprobs become populated).",
+            flush=True,
+        )
+      return train_example
+
+    if not _state["announced"]:
+      _state["announced"] = True
+      sample0 = rollout_logprobs[0]
+      sample0_len = len(sample0) if hasattr(sample0, "__len__") else "?"
+      print(
+          "[my_train_rl] _generate_and_compute_advantage:"
+          f" filling old_per_token_logps from rollout."
+          f" completion_mask.shape={(bs, max_len)},"
+          f" len(rollout_logprobs)={len(rollout_logprobs)},"
+          f" first_seq_len={sample0_len},"
+          f" element_type={type(sample0).__name__},"
+          f" total_filled={total_filled},"
+          f" mean_logp={float(padded[padded != 0].mean()) if total_filled else 'N/A'}",
+          flush=True,
+      )
+
+    return train_example.replace(old_per_token_logps=jnp.asarray(padded))
+
+  _gl.GrpoLearner._generate_and_compute_advantage = _patched_gca
+  print(
+      "[my_train_rl] patched GrpoLearner._generate_and_compute_advantage:"
+      " old_per_token_logps now sourced from vLLM rollout (mimics NeMo-RL,"
+      " brings probs_ratio ≠ 1 → real PPO clipping)",
+      flush=True,
+  )
+
+
 def _patch_print_train_step():
   """Force-log every actor train step + eval step (the upstream peft_trainer
   Train-step log is silent in our build for unknown reasons; this gives us
@@ -531,12 +669,34 @@ def _patch_evaluate_rl():
 
 
 def main(argv: list[str]) -> None:
+  import os as _os
+
   _patch_maxtext_rewards()
   _patch_process_data()
   _patch_tunix_loss()
   _patch_evaluate_rl()
   _patch_pass_eval_ds_to_trainer()
   _patch_vllm_rollout_kwargs()
+
+  # v11 mechanism patches — gated behind ENABLE_ROLLOUT_OLDLOGPS=1 (default off).
+  # When enabled, vLLM is asked to return per-token logprobs and those are stamped
+  # onto train_example.old_per_token_logps so PPO ratio ≠ 1 (real clipping).
+  # Cost: ~+50% per-step wall (return_logprobs=True slows the rollout).
+  # Benefit (measured v11 vs v10, same hyperparams): pg_clipfrac 0 → ~10%, but
+  # post-RL VTC only +0.79pp. Default off so future experiments stay fast; flip
+  # on for mechanism studies. See scratchpad_maxtext.md "v11" section.
+  if _os.environ.get("ENABLE_ROLLOUT_OLDLOGPS", "0") == "1":
+    _patch_rollout_return_logprobs()
+    _patch_grpo_old_logprobs()
+  else:
+    print(
+        "[my_train_rl] ENABLE_ROLLOUT_OLDLOGPS=0 (default):"
+        " skipping rollout-old-logprobs patches; using tunix's stop_grad"
+        " shortcut (probs_ratio≡1, pg_clipfrac=0). Set"
+        " ENABLE_ROLLOUT_OLDLOGPS=1 to enable real PPO clipping at +50% step time.",
+        flush=True,
+    )
+
   _patch_print_train_step()
 
   # Defer the import until after patching so MaxText sees patched modules.

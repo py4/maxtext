@@ -14,6 +14,12 @@
 #   BATCH_SIZE=4               # training prompts per step (matches GPU)
 #   ROLLOUT_TEMP=1.0           # GPU uses 1.0, vLLM default is 0.6
 #   RUN_NAME=qwen3-1p7b-grpo-vtc-runX
+#
+# Mechanism toggle (off by default — see scratchpad_maxtext.md "v11" section):
+#   ENABLE_ROLLOUT_OLDLOGPS=1  # feed vLLM rollout logprobs as old_per_token_logps
+#                                so PPO ratio ≠ 1 (real clipping). Costs ~+50%
+#                                step time; bought only +0.79pp post-RL VTC in v11
+#                                vs v10. Default off.
 
 set -ex
 
